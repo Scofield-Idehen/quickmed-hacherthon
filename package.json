@@ -1,0 +1,24 @@
+{
+  "name": "quickmed-hacherthon",
+  "version": "1.0.0",
+  "description": "> **Built for the Stellar WA Build Residency 2025** > Live demo: [quick-med.xyz/chat](https://quick-med.xyz/chat) > Test the bot directly on WhatsApp → **+234 811 273 5098**",
+  "main": "stellarPaymentService.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Scofield-Idehen/quickmed-hacherthon.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Scofield-Idehen/quickmed-hacherthon/issues"
+  },
+  "homepage": "https://github.com/Scofield-Idehen/quickmed-hacherthon#readme",
+  "dependencies": {
+    "@stellar/stellar-sdk": "^15.0.1",
+    "dotenv": "^17.4.2"
+  }
+}
