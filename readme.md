@@ -2,7 +2,7 @@
 
 > **Built for the Stellar WA Build Residency 2025**
 > Live demo: [quick-med.xyz/chat](https://quick-med.xyz/chat)
-> Test the bot directly on WhatsApp → **+234 811 273 5098**
+> Test the bot directly on WhatsApp → **+234 9156188030**
 
 ---
 
