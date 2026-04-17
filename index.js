@@ -616,25 +616,34 @@ async function handleBookingFlow(from, phon_no_id, text, session, list_response,
         await sendTextMessage(phon_no_id, from, `Cancelled. Type *book* to book an appointment.`);
         break;
       }
+      // Verify code exists
+      const { data: company } = await dbService.supabase
+        .from('companies').select('id, name, status').eq('code', code).eq('status', 'active').single();
+      if (!company) {
+        await sendTextMessage(phon_no_id, from,
+          `❌ That company code wasn't found.\n\nPlease check with your HR team and try again.\n\nType *cancel* to go back.`
+        );
+        break;
+      }
+      session.data.corpCode    = code;
+      session.data.companyName = company.name;
+      session.step             = 'awaiting_corp_name';
+      updateBookingSession(from, session);
+      await sendTextMessage(phon_no_id, from,
+        `✅ Found: *${company.name}*\n\nPlease enter your full name to complete registration:`
+      );
+      break;
+    }
+
+    // ── Corporate: employee name entry ────────────────────
+    case 'awaiting_corp_name': {
+      const name = userMessage.trim();
+      if (!name || name.length < 2) {
+        await sendTextMessage(phon_no_id, from, `Please enter your full name:`);
+        break;
+      }
       const result = await corporateService.registerEmployeeByCode(from, session.data.corpCode, name);
       completeBookingSession(from);
-      if (result.success) {
-        await sendTextMessage(phon_no_id, from,
-          `🎉 *You're now registered under ${result.company.name}!*\n\n` +
-          `✅ All your consultations are covered — no payment needed.\n\n` +
-          `You can also add family members:\n` +
-          `Type *add family* to register your spouse or children.\n\n` +
-          `Type *book* whenever you need a doctor.`
-        );
-      } else if (result.reason === 'already_registered') {
-        await sendTextMessage(phon_no_id, from,
-          `You are already registered. Type *book* to book an appointment.`
-        );
-      } else {
-        await sendTextMessage(phon_no_id, from,
-          `❌ Registration failed. Please try again or contact support: ${process.env.ADMIN_WHATSAPP || '+2348112735098'}`
-        );
-      }
       break;
     }
 

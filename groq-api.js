@@ -158,6 +158,17 @@ function isEmergency(message) {
   return emergencyKeywords.some(keyword => lower.includes(keyword));
 }
 
+/**
+ * Emergency response
+ */
+function getEmergencyResponse() {
+  return `🚨 **THIS SOUNDS LIKE AN EMERGENCY**\n\n` +
+         `⚠️ Please call emergency services immediately:\n` +
+         `• Nigeria: 112 or 767\n` +
+         `• Nearest hospital emergency room\n\n` +
+         `This is a serious situation that requires immediate medical attention.\n\n` +
+         `Our online service is for non-emergency consultations only.`;
+}
 
 module.exports = {
   createGroqClient,
