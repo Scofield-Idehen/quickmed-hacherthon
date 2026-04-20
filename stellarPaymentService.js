@@ -1,28 +1,24 @@
 // stellarPaymentService.js
 // Handles USDC payment initialization and verification for diaspora patients.
-// Mirrors the structure of paystackService.js so the booking flow can treat
-// both payment rails identically — same session fields, same verify pattern.
 //
-// Flow:
-//   1. initializeStellarPayment()  → returns payment request (address + amount + memo)
-//   2. Patient pays via any Stellar wallet (Lobstr, Freighter, Stellarterm, Valora)
-//   3. verifyStellarPayment()      → polls Horizon for matching tx → returns verified:true
-//   4. Booking completes identically to a Paystack booking
+// TESTNET vs MAINNET behaviour:
+//   STELLAR_NETWORK=testnet  → Stellar Laboratory links + TEST_BYPASS support
+//   STELLAR_NETWORK=mainnet  → Real Lobstr deep links + correct USDC issuer
 
-const stellarService = require('./stellarService');
+const stellarService             = require('./stellarService');
+const { ngnToUsdc, getRateInfo } = require('./exchangeRateService');
 require('dotenv').config();
 
-// ── 1. INITIALIZE STELLAR PAYMENT ─────────────────────────────────────────────
-//
-// Generates a USDC payment request for the patient.
-// Called at the same point in the booking flow where Paystack is initialized.
-//
-// @param sessionRef  - Unique booking session reference (reuses Paystack-style QM ref)
-// @param ngnAmount   - Fee in Nigerian Naira (converted to USDC internally)
-// @param metadata    - { patient_name, phone, specialty, date, time, doctor_id }
-//
-// Returns: { success, reference, amountUSDC, amountNGN, stellarUri, receivingAddress,
-//            memo, manualInstructions, walletLinks }
+const USDC_ISSUER = {
+  mainnet: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
+  testnet: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+};
+
+function getNetwork() { return (process.env.STELLAR_NETWORK || 'testnet').toLowerCase(); }
+function isTestnet()   { return getNetwork() === 'testnet'; }
+function usdcIssuer()  { return USDC_ISSUER[getNetwork()] || USDC_ISSUER.testnet; }
+
+// ── 1. INITIALIZE STELLAR PAYMENT ────────────────────────────────────────────
 
 async function initializeStellarPayment(sessionRef, ngnAmount, metadata = {}) {
   try {
@@ -30,6 +26,13 @@ async function initializeStellarPayment(sessionRef, ngnAmount, metadata = {}) {
       console.error('[stellar-pay] Stellar keys not configured');
       return { success: false, message: 'Stellar payment not configured' };
     }
+
+    // Fetch live rate ONCE here — pass it to generatePaymentRequest so
+    // stellarService doesn't make a second fetch for the same payment.
+    const amountUSDC = await ngnToUsdc(ngnAmount);
+    const rateInfo   = await getRateInfo();
+
+    console.log(`[stellar-pay] Rate: ₦${rateInfo.rate}/USDC (${rateInfo.source}) | ₦${ngnAmount} → ${amountUSDC} USDC`);
 
     const description = metadata.specialty
       ? `${metadata.specialty} consultation — ${metadata.date} ${metadata.time}`
@@ -39,33 +42,35 @@ async function initializeStellarPayment(sessionRef, ngnAmount, metadata = {}) {
       sessionRef,
       ngnAmount,
       metadata.patient_name || 'Patient',
-      description
+      description,
+      amountUSDC   // pass pre-computed so stellarService doesn't fetch again
     );
 
     if (!paymentRequest.success) {
       return { success: false, message: paymentRequest.reason };
     }
 
-    const { amountUSDC, memo, stellarUri, receivingAddress, manualInstructions } = paymentRequest;
+    const { memo, stellarUri, receivingAddress, manualInstructions } = paymentRequest;
+    const walletLinks = buildWalletLinks(receivingAddress, amountUSDC, memo);
 
-    // Deep links for the most popular wallets in Africa/diaspora
-    // Lobstr is dominant in Nigeria; Freighter for web users
-    const walletLinks = buildWalletLinks(stellarUri, receivingAddress, amountUSDC, memo);
-
-    console.log(`[stellar-pay] ✅ Payment initialized — ref: ${sessionRef} | ${amountUSDC} USDC`);
+    console.log(`[stellar-pay] ✅ Initialized — ref: ${sessionRef} | ${amountUSDC} USDC | ${getNetwork()}`);
 
     return {
-      success:            true,
-      reference:          sessionRef,  // matches Paystack naming so session code is identical
-      paymentMethod:      'stellar',
+      success:          true,
+      reference:        sessionRef,
+      paymentMethod:    'stellar',
+      network:          getNetwork(),
+      isTestnet:        isTestnet(),
       amountUSDC,
-      amountNGN:          ngnAmount,
+      amountNGN:        ngnAmount,
+      exchangeRate:     rateInfo.rate,
+      rateSource:       rateInfo.source,
       memo,
       stellarUri,
       receivingAddress,
       manualInstructions,
       walletLinks,
-      message:            'Stellar payment initialized',
+      message:          'Stellar payment initialized',
     };
 
   } catch (err) {
@@ -76,32 +81,42 @@ async function initializeStellarPayment(sessionRef, ngnAmount, metadata = {}) {
 
 // ── 2. VERIFY STELLAR PAYMENT ─────────────────────────────────────────────────
 //
-// Checks Horizon for a payment matching the memo and expected amount.
-// Called when patient taps "Verify Payment" — same UX as Paystack verification.
-//
-// @param memo              - The memo string from the payment request
-// @param expectedAmountNGN - Original NGN amount (converted to USDC for comparison)
-//
-// Returns: { success, verified, amountUSDC, txHash, paidAt, message }
+// Uses the same live rate (from cache) that was used at init time —
+// so the expected USDC amount during verification matches what the patient
+// was shown. The 1% on-chain tolerance covers any tiny cache drift.
 
 async function verifyStellarPayment(memo, expectedAmountNGN) {
   try {
-    const expectedUSDC = stellarService.ngnToUsdc(expectedAmountNGN);
+    // Testnet bypass
+    if (isTestnet() && typeof memo === 'string' && memo.endsWith(':TEST_BYPASS')) {
+      console.log(`[stellar-pay] 🧪 TEST_BYPASS accepted for memo: ${memo}`);
+      const bypassUSDC = await ngnToUsdc(expectedAmountNGN);
+      return {
+        success:     true,
+        verified:    true,
+        amountUSDC:  bypassUSDC,
+        amountNGN:   expectedAmountNGN,
+        txHash:      'TEST_BYPASS_TX',
+        explorerUrl: null,
+        paidAt:      new Date().toISOString(),
+        message:     'TEST_BYPASS — simulated payment (testnet only)',
+      };
+    }
+
+    // Convert NGN → USDC using live rate (same cached value used at init)
+    const expectedUSDC = await ngnToUsdc(expectedAmountNGN);
+    console.log(`[stellar-pay] Verifying ${memo} — expecting ${expectedUSDC} USDC (₦${expectedAmountNGN})`);
 
     const result = await stellarService.verifyStellarPayment(memo, expectedUSDC);
 
     if (!result.success) {
-      return {
-        success:  false,
-        verified: false,
-        message:  result.reason || 'Verification error',
-      };
+      return { success: false, verified: false, message: result.reason || 'Verification error' };
     }
 
     if (!result.verified) {
       const reasonMessages = {
-        payment_not_found:  'Payment not found yet — please complete the transfer and try again.',
-        insufficient_amount:`Payment received but amount was insufficient (paid ${result.paidAmount} USDC, expected ${expectedUSDC} USDC).`,
+        payment_not_found:   'Payment not found yet — please complete the transfer and try again.',
+        insufficient_amount: `Payment received but amount was too low (got ${result.paidAmount} USDC, need ${expectedUSDC} USDC).`,
       };
       return {
         success:  true,
@@ -127,72 +142,110 @@ async function verifyStellarPayment(memo, expectedAmountNGN) {
   }
 }
 
-// ── 3. FORMAT PAYMENT MESSAGE FOR WHATSAPP ────────────────────────────────────
+// ── 3. FORMAT PAYMENT MESSAGE ─────────────────────────────────────────────────
 //
-// Returns a WhatsApp-formatted message with payment instructions.
-// Sent to the patient after initializeStellarPayment() succeeds.
-// Mirrors formatPaymentMessage() in paystackService.js.
+// Now shows the live exchange rate so patients know exactly what they're getting.
 
 function formatStellarPaymentMessage(paymentData, doctorName, date, time) {
-  const { amountUSDC, amountNGN, receivingAddress, memo, walletLinks, manualInstructions } = paymentData;
+  const {
+    amountUSDC, amountNGN, receivingAddress, memo,
+    walletLinks, exchangeRate, rateSource,
+  } = paymentData;
+  const testnet = isTestnet();
 
-  return (
-    `💫 *Pay with USDC on Stellar*\n\n` +
-    `👨‍⚕️ Dr. ${doctorName}\n` +
+  const shortAddr  = `${receivingAddress.slice(0, 8)}...${receivingAddress.slice(-6)}`;
+  const rateLabel  = rateSource === 'live' ? '_(live)_' : '_(estimated)_';
+  const rateDisplay = exchangeRate
+    ? `\n📊 *Rate:* ₦${Number(exchangeRate).toLocaleString()}/USDC ${rateLabel}`
+    : '';
+
+  const header =
+    `⭐ *Pay with USDC on Stellar*` +
+    (testnet ? ` _(TESTNET)_` : ``) + `\n\n` +
+    (doctorName ? `👨‍⚕️ Dr. ${doctorName}\n` : ``) +
     `📅 ${date} at ${time}\n\n` +
-    `━━━━━━━━━━━━━━━━\n` +
-    `💵 *Amount:* ${amountUSDC} USDC\n` +
-    `   _(≈ ₦${Number(amountNGN).toLocaleString()})_\n\n` +
-    `📲 *Pay via wallet app:*\n` +
-    `${walletLinks.lobstr ? `• Lobstr: ${walletLinks.lobstr}\n` : ''}` +
-    `${walletLinks.freighter ? `• Freighter: ${walletLinks.freighter}\n` : ''}` +
-    `\n` +
-    `🔢 *Or send manually:*\n` +
-    `• To: \`${receivingAddress}\`\n` +
-    `• Amount: *${amountUSDC} USDC*\n` +
-    `• Memo (text): *${memo}*\n` +
-    `• ⚠️ _Memo is required — without it we can't match your payment_\n\n` +
-    `━━━━━━━━━━━━━━━━\n` +
-    `After sending, tap *Verify Payment* to confirm your booking.\n\n` +
-    `Need Stellar/USDC? Download Lobstr: https://lobstr.co`
-  );
+    `💵 *Amount:* ${amountUSDC} USDC _(≈ ₦${Number(amountNGN).toLocaleString()})_` +
+    rateDisplay + `\n` +
+    `🔑 *Memo:* \`${memo}\`  ← _required_\n\n`;
+
+  if (testnet) {
+    return (
+      header +
+      `🧪 *TESTNET MODE — use Stellar Laboratory*\n\n` +
+      `📲 *Open Stellar Laboratory:*\n${walletLinks.laboratory}\n\n` +
+      `📋 *Fill in these values:*\n` +
+      `• Destination: \`${receivingAddress}\`\n` +
+      `• Asset: USDC (issuer: \`${usdcIssuer().slice(0, 8)}...\`)\n` +
+      `• Amount: *${amountUSDC}*\n` +
+      `• Memo type: Text · Memo value: *${memo}*\n\n` +
+      `⚠️ _Memo is required — without it payment cannot be matched._\n\n` +
+      `━━━━━━━━━━━━━━━━\n` +
+      `🧑‍💻 *Developer shortcut — skip the send:*\n` +
+      `Type this exactly and tap *Verify Payment*:\n` +
+      `\`${memo}:TEST_BYPASS\`\n` +
+      `━━━━━━━━━━━━━━━━\n\n` +
+      `Once sent (or bypassed), tap *Verify Payment* to confirm.`
+    );
+  } else {
+    return (
+      header +
+      `📲 *Tap to pay in Lobstr:*\n${walletLinks.lobstr}\n\n` +
+      `🔢 *Or send manually in any Stellar wallet:*\n` +
+      `• Address: \`${shortAddr}\`\n  _(full: ${receivingAddress})_\n` +
+      `• Asset: *USDC*\n• Amount: *${amountUSDC}*\n• Memo (text): *${memo}*\n\n` +
+      `⚠️ _Memo is required — without it payment cannot be matched._\n\n` +
+      `Once sent, tap *Verify Payment* to confirm your booking.\n` +
+      `New to Stellar? Get Lobstr at lobstr.co`
+    );
+  }
 }
 
 // ── 4. WALLET DEEP LINKS ──────────────────────────────────────────────────────
-//
-// Builds deep links for popular wallets so patient can tap to open directly.
-// Most wallets support SEP-7 (web+stellar: URI scheme).
 
-function buildWalletLinks(stellarUri, address, amountUSDC, memo) {
-  // Lobstr — most popular wallet in Africa
-  // Supports web+stellar: URI directly
-  const lobstr = `https://lobstr.co/pay?${new URLSearchParams({
-    destination: address,
-    asset:       'USDC',
-    amount:      String(amountUSDC),
-    memo,
-    memo_type:   'text',
-  }).toString()}`;
+function buildWalletLinks(address, amountUSDC, memo) {
+  const issuer = usdcIssuer();
 
-  // Freighter — browser extension wallet, popular for web users
-  // Doesn't support deep links but shows SEP-7 URI
-  const freighter = stellarUri;
-
-  return { lobstr, freighter, sep7: stellarUri };
+  if (isTestnet()) {
+    const labOp = {
+      attributes: { sourceAccount: '', sequence: '', fee: '100', memoType: 'MEMO_TEXT', memoContent: memo },
+      operations: [{ id: 0, name: 'payment', attributes: { destination: address, asset: `USDC:${issuer}`, amount: String(amountUSDC) } }]
+    };
+    return {
+      laboratory: `https://laboratory.stellar.org/#txbuilder?network=test&params=${encodeURIComponent(JSON.stringify(labOp))}`,
+      lobstr:     null,
+      sep7:       null,
+    };
+  } else {
+    const lobstrParams = new URLSearchParams({
+      destination: address, amount: String(amountUSDC),
+      asset_code: 'USDC', asset_issuer: issuer,
+      memo, memo_type: 'text',
+    });
+    return { lobstr: `https://lobstr.co/pay?${lobstrParams.toString()}`, laboratory: null, sep7: null };
+  }
 }
 
-// ── 5. CHECK IF STELLAR IS AVAILABLE ─────────────────────────────────────────
-// Called before showing the Stellar payment option to the patient.
+// ── 5. TEST BYPASS HELPER ─────────────────────────────────────────────────────
 
-function isAvailable() {
-  return stellarService.isConfigured();
+function extractTestBypass(messageText, currentMemo) {
+  if (!isTestnet()) return null;
+  const clean = (messageText || '').trim();
+  if (clean === 'TEST_BYPASS' || clean === `${currentMemo}:TEST_BYPASS`) {
+    return `${currentMemo}:TEST_BYPASS`;
+  }
+  return null;
 }
 
-// ── Exports ───────────────────────────────────────────────────────────────────
+// ── 6. AVAILABILITY CHECK ─────────────────────────────────────────────────────
+
+function isAvailable() { return stellarService.isConfigured(); }
 
 module.exports = {
   initializeStellarPayment,
   verifyStellarPayment,
   formatStellarPaymentMessage,
+  extractTestBypass,
   isAvailable,
+  isTestnet,
+  getNetwork,
 };
