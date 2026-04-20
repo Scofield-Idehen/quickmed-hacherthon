@@ -655,6 +655,9 @@ router.get("/", (req, res) => {
             msg += `👤 Patient: ${a.patient_name || a.patient_phone}\n`;
             msg += `📋 ID: ${a.booking_id || a.id}\n`;
             msg += `📹 Link: ${link}\n`;
+                  `Patient: ${reportData.patientName}`,
+      `Doctor: ${reportData.doctorName} (${reportData.specialty})`,
+      `Consultation Date: ${reportData.consultationDate}`,
           });
           msg += `\n─────────────────\nType *help* for other commands.`;
 
